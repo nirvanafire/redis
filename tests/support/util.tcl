@@ -77,6 +77,12 @@ proc getInfoProperty {infostr property} {
     }
 }
 
+proc cluster_info {r field} {
+    if {[regexp "^$field:(.*?)\r\n" [$r cluster info] _ value]} {
+        set _ $value
+    }
+}
+
 # Return value for INFO property
 proc status {r property} {
     set _ [getInfoProperty [{*}$r info] $property]
@@ -122,7 +128,7 @@ proc wait_replica_online r {
     wait_for_condition 50 100 {
         [string match "*slave0:*,state=online*" [$r info replication]]
     } else {
-        fail "replica didn't sync in time"
+        fail "replica didn't online in time"
     }
 }
 
@@ -130,7 +136,7 @@ proc wait_for_ofs_sync {r1 r2} {
     wait_for_condition 50 100 {
         [status $r1 master_repl_offset] eq [status $r2 master_repl_offset]
     } else {
-        fail "replica didn't sync in time"
+        fail "replica offset didn't match in time"
     }
 }
 
@@ -823,9 +829,19 @@ proc subscribe {client channels} {
     consume_subscribe_messages $client subscribe $channels
 }
 
+proc ssubscribe {client channels} {
+    $client ssubscribe {*}$channels
+    consume_subscribe_messages $client ssubscribe $channels
+}
+
 proc unsubscribe {client {channels {}}} {
     $client unsubscribe {*}$channels
     consume_subscribe_messages $client unsubscribe $channels
+}
+
+proc sunsubscribe {client {channels {}}} {
+    $client sunsubscribe {*}$channels
+    consume_subscribe_messages $client sunsubscribe $channels
 }
 
 proc psubscribe {client channels} {

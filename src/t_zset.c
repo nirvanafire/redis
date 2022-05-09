@@ -120,8 +120,9 @@ void zslFree(zskiplist *zsl) {
  * (both inclusive), with a powerlaw-alike distribution where higher
  * levels are less likely to be returned. */
 int zslRandomLevel(void) {
+    static const int threshold = ZSKIPLIST_P*RAND_MAX;
     int level = 1;
-    while ((random()&0xFFFF) < (ZSKIPLIST_P * 0xFFFF))
+    while (random() < threshold)
         level += 1;
     return (level<ZSKIPLIST_MAXLEVEL) ? level : ZSKIPLIST_MAXLEVEL;
 }
@@ -720,8 +721,8 @@ zskiplistNode *zslLastInLexRange(zskiplist *zsl, zlexrangespec *range) {
 
 double zzlStrtod(unsigned char *vstr, unsigned int vlen) {
     char buf[128];
-    if (vlen > sizeof(buf))
-        vlen = sizeof(buf);
+    if (vlen > sizeof(buf) - 1)
+        vlen = sizeof(buf) - 1;
     memcpy(buf,vstr,vlen);
     buf[vlen] = '\0';
     return strtod(buf,NULL);
@@ -1026,19 +1027,27 @@ unsigned char *zzlDelete(unsigned char *zl, unsigned char *eptr) {
 
 unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, double score) {
     unsigned char *sptr;
-    char scorebuf[128];
+    char scorebuf[MAX_D2STRING_CHARS];
     int scorelen;
-
-    scorelen = d2string(scorebuf,sizeof(scorebuf),score);
+    long long lscore;
+    int score_is_long = double2ll(score, &lscore);
+    if (!score_is_long)
+        scorelen = d2string(scorebuf,sizeof(scorebuf),score);
     if (eptr == NULL) {
         zl = lpAppend(zl,(unsigned char*)ele,sdslen(ele));
-        zl = lpAppend(zl,(unsigned char*)scorebuf,scorelen);
+        if (score_is_long)
+            zl = lpAppendInteger(zl,lscore);
+        else
+            zl = lpAppend(zl,(unsigned char*)scorebuf,scorelen);
     } else {
         /* Insert member before the element 'eptr'. */
         zl = lpInsertString(zl,(unsigned char*)ele,sdslen(ele),eptr,LP_BEFORE,&sptr);
 
         /* Insert score after the member. */
-        zl = lpInsertString(zl,(unsigned char*)scorebuf,scorelen,sptr,LP_AFTER,NULL);
+        if (score_is_long)
+            zl = lpInsertInteger(zl,lscore,sptr,LP_AFTER,NULL);
+        else
+            zl = lpInsertString(zl,(unsigned char*)scorebuf,scorelen,sptr,LP_AFTER,NULL);
     }
     return zl;
 }
@@ -3963,7 +3972,7 @@ void zpopminCommand(client *c) {
     zpopMinMaxCommand(c, ZSET_MIN);
 }
 
-/* ZMAXPOP key [<count>] */
+/* ZPOPMAX key [<count>] */
 void zpopmaxCommand(client *c) {
     zpopMinMaxCommand(c, ZSET_MAX);
 }
@@ -4350,12 +4359,12 @@ void zmpopGenericCommand(client *c, int numkeys_idx, int is_block) {
     }
 }
 
-/* ZMPOP numkeys [<key> ...] MIN|MAX [COUNT count] */
+/* ZMPOP numkeys key [<key> ...] MIN|MAX [COUNT count] */
 void zmpopCommand(client *c) {
     zmpopGenericCommand(c, 1, 0);
 }
 
-/* BZMPOP timeout numkeys [<key> ...] MIN|MAX [COUNT count] */
+/* BZMPOP timeout numkeys key [<key> ...] MIN|MAX [COUNT count] */
 void bzmpopCommand(client *c) {
     zmpopGenericCommand(c, 2, 1);
 }

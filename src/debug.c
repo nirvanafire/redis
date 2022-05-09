@@ -416,6 +416,8 @@ void debugCommand(client *c) {
 "    Like HTSTATS but for the hash table stored at <key>'s value.",
 "LOADAOF",
 "    Flush the AOF buffers on disk and reload the AOF in memory.",
+"REPLICATE <string>",
+"    Replicates the provided string to replicas, allowing data divergence.",
 #ifdef USE_JEMALLOC
 "MALLCTL <key> [<val>]",
 "    Get or set a malloc tuning integer.",
@@ -795,6 +797,10 @@ NULL
              * also have a normal reply type after the attribute. */
             addReplyBulkCString(c,"Some real reply following the attribute");
         } else if (!strcasecmp(name,"push")) {
+            if (c->resp < 3) {
+                addReplyError(c,"RESP2 is not supported by this command");
+                return;
+	    }
             addReplyPushLen(c,2);
             addReplyBulkCString(c,"server-cpu-usage");
             addReplyLongLong(c,42);
@@ -844,6 +850,10 @@ NULL
                c->argc == 3)
     {
         server.aof_flush_sleep = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"replicate") && c->argc >= 3) {
+        replicationFeedSlaves(server.slaves, server.slaveseldb,
+                c->argv + 2, c->argc - 2);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"error") && c->argc == 3) {
         sds errstr = sdsnewlen("-",1);
@@ -1952,7 +1962,7 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
         serverLog(LL_WARNING,
         "Accessing address: %p", (void*)info->si_addr);
     }
-    if (info->si_code <= SI_USER && info->si_pid != -1) {
+    if (info->si_code == SI_USER && info->si_pid != -1) {
         serverLog(LL_WARNING, "Killed by PID: %ld, UID: %d", (long) info->si_pid, info->si_uid);
     }
 

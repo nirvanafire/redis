@@ -147,7 +147,6 @@ client *createClient(connection *conn) {
     c->ref_block_pos = 0;
     c->qb_pos = 0;
     c->querybuf = sdsempty();
-    c->pending_querybuf = sdsempty();
     c->querybuf_peak = 0;
     c->reqtype = 0;
     c->argc = 0;
@@ -161,12 +160,14 @@ client *createClient(connection *conn) {
     c->bulklen = -1;
     c->sentlen = 0;
     c->flags = 0;
+    c->slot = -1;
     c->ctime = c->lastinteraction = server.unixtime;
     clientSetDefaultAuth(c);
     c->replstate = REPL_STATE_NONE;
     c->repl_start_cmd_stream_on_ack = 0;
     c->reploff = 0;
     c->read_reploff = 0;
+    c->repl_applied = 0;
     c->repl_ack_off = 0;
     c->repl_ack_time = 0;
     c->repl_last_partial_write = 0;
@@ -201,7 +202,7 @@ client *createClient(connection *conn) {
     c->pending_read_list_node = NULL;
     c->client_tracking_redirection = 0;
     c->client_tracking_prefixes = NULL;
-    c->last_memory_usage = c->last_memory_usage_on_bucket_update = 0;
+    c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
     c->auth_callback = NULL;
     c->auth_callback_privdata = NULL;
@@ -215,6 +216,23 @@ client *createClient(connection *conn) {
     return c;
 }
 
+void installClientWriteHandler(client *c) {
+    int ae_barrier = 0;
+    /* For the fsync=always policy, we want that a given FD is never
+     * served for reading and writing in the same event loop iteration,
+     * so that in the middle of receiving the query, and serving it
+     * to the client, we'll call beforeSleep() that will do the
+     * actual fsync of AOF to disk. the write barrier ensures that. */
+    if (server.aof_state == AOF_ON &&
+        server.aof_fsync == AOF_FSYNC_ALWAYS)
+    {
+        ae_barrier = 1;
+    }
+    if (connSetWriteHandlerWithBarrier(c->conn, sendReplyToClient, ae_barrier) == C_ERR) {
+        freeClientAsync(c);
+    }
+}
+
 /* This function puts the client in the queue of clients that should write
  * their output buffers to the socket. Note that it does not *yet* install
  * the write handler, to start clients are put in a queue of clients that need
@@ -222,7 +240,7 @@ client *createClient(connection *conn) {
  * handleClientsWithPendingWrites() function).
  * If we fail and there is more data to write, compared to what the socket
  * buffers can hold, then we'll really install the handler. */
-void clientInstallWriteHandler(client *c) {
+void putClientInPendingWriteQueue(client *c) {
     /* Schedule the client to write the output buffers to the socket only
      * if not already done and, for slaves, if the slave can actually receive
      * writes at this stage. */
@@ -285,11 +303,11 @@ int prepareClientToWrite(client *c) {
      * it should already be setup to do so (it has already pending data).
      *
      * If CLIENT_PENDING_READ is set, we're in an IO thread and should
-     * not install a write handler. Instead, it will be done by
-     * handleClientsWithPendingReadsUsingThreads() upon return.
+     * not put the client in pending write queue. Instead, it will be
+     * done by handleClientsWithPendingReadsUsingThreads() upon return.
      */
     if (!clientHasPendingReplies(c) && io_threads_op == IO_THREADS_OP_IDLE)
-            clientInstallWriteHandler(c);
+        putClientInPendingWriteQueue(c);
 
     /* Authorize the caller to queue in the output buffer of this client. */
     return C_OK;
@@ -521,6 +539,21 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
             showLatestBacklog();
         }
         server.stat_unexpected_error_replies++;
+
+        /* Based off the propagation error behavior, check if we need to panic here. There
+         * are currently two checked cases:
+         * * If this command was from our master and we are not a writable replica.
+         * * We are reading from an AOF file. */
+        int panic_in_replicas = (ctype == CLIENT_TYPE_MASTER && server.repl_slave_ro)
+            && (server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC ||
+            server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC_ON_REPLICAS);
+        int panic_in_aof = c->id == CLIENT_ID_AOF 
+            && server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC;
+        if (panic_in_replicas || panic_in_aof) {
+            serverPanic("This %s panicked sending an error to its %s"
+                " after processing the command '%s'",
+                from, to, cmdname ? cmdname : "<unknown>");
+        }
     }
 }
 
@@ -1061,7 +1094,7 @@ void addReplySubcommandSyntaxError(client *c) {
     sds cmd = sdsnew((char*) c->argv[0]->ptr);
     sdstoupper(cmd);
     addReplyErrorFormat(c,
-        "Unknown subcommand or wrong number of arguments for '%.128s'. Try %s HELP.",
+        "unknown subcommand or wrong number of arguments for '%.128s'. Try %s HELP.",
         (char*)c->argv[1]->ptr,cmd);
     sdsfree(cmd);
 }
@@ -1568,7 +1601,6 @@ void freeClient(client *c) {
 
     /* Free the query buffer */
     sdsfree(c->querybuf);
-    sdsfree(c->pending_querybuf);
     c->querybuf = NULL;
 
     /* Deallocate structures used to block on blocking ops. */
@@ -1940,7 +1972,7 @@ int writeToClient(client *c, int handler_installed) {
     if (!clientHasPendingReplies(c)) {
         c->sentlen = 0;
         /* Note that writeToClient() is called in a threaded way, but
-         * adDeleteFileEvent() is not thread safe: however writeToClient()
+         * aeDeleteFileEvent() is not thread safe: however writeToClient()
          * is always called with handler_installed set to 0 from threads
          * so we are fine. */
         if (handler_installed) {
@@ -1954,7 +1986,11 @@ int writeToClient(client *c, int handler_installed) {
             return C_ERR;
         }
     }
-    updateClientMemUsage(c);
+    /* Update client's memory usage after writing.
+     * Since this isn't thread safe we do this conditionally. In case of threaded writes this is done in
+     * handleClientsWithPendingWritesUsingThreads(). */
+    if (io_threads_op == IO_THREADS_OP_IDLE)
+        updateClientMemUsage(c);
     return C_OK;
 }
 
@@ -1992,20 +2028,7 @@ int handleClientsWithPendingWrites(void) {
         /* If after the synchronous writes above we still have data to
          * output to the client, we need to install the writable handler. */
         if (clientHasPendingReplies(c)) {
-            int ae_barrier = 0;
-            /* For the fsync=always policy, we want that a given FD is never
-             * served for reading and writing in the same event loop iteration,
-             * so that in the middle of receiving the query, and serving it
-             * to the client, we'll call beforeSleep() that will do the
-             * actual fsync of AOF to disk. the write barrier ensures that. */
-            if (server.aof_state == AOF_ON &&
-                server.aof_fsync == AOF_FSYNC_ALWAYS)
-            {
-                ae_barrier = 1;
-            }
-            if (connSetWriteHandlerWithBarrier(c->conn, sendReplyToClient, ae_barrier) == C_ERR) {
-                freeClientAsync(c);
-            }
+            installClientWriteHandler(c);
         }
     }
     return processed;
@@ -2019,6 +2042,7 @@ void resetClient(client *c) {
     c->reqtype = 0;
     c->multibulklen = 0;
     c->bulklen = -1;
+    c->slot = -1;
 
     if (c->deferred_reply_errors)
         listRelease(c->deferred_reply_errors);
@@ -2072,7 +2096,7 @@ void unprotectClient(client *c) {
         c->flags &= ~CLIENT_PROTECTED;
         if (c->conn) {
             connSetReadHandler(c->conn,readQueryFromClient);
-            if (clientHasPendingReplies(c)) clientInstallWriteHandler(c);
+            if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
         }
     }
 }
@@ -2128,7 +2152,7 @@ int processInlineBuffer(client *c) {
      * we got some desynchronization in the protocol, for example
      * because of a PSYNC gone bad.
      *
-     * However the is an exception: masters may send us just a newline
+     * However there is an exception: masters may send us just a newline
      * to keep the connection active. */
     if (querylen != 0 && c->flags & CLIENT_MASTER) {
         sdsfreesplitres(argv,argc);
@@ -2292,8 +2316,12 @@ int processMultibulkBuffer(client *c) {
             }
 
             c->qb_pos = newline-c->querybuf+2;
-            if (ll >= PROTO_MBULK_BIG_ARG) {
-                /* If we are going to read a large object from network
+            if (!(c->flags & CLIENT_MASTER) && ll >= PROTO_MBULK_BIG_ARG) {
+                /* When the client is not a master client (because master
+                 * client's querybuf can only be trimmed after data applied
+                 * and sent to replicas).
+                 *
+                 * If we are going to read a large object from network
                  * try to make it likely that it will start at c->querybuf
                  * boundary so that we can optimize object creation
                  * avoiding a large copy of data.
@@ -2324,10 +2352,11 @@ int processMultibulkBuffer(client *c) {
                 c->argv = zrealloc(c->argv, sizeof(robj*)*c->argv_len);
             }
 
-            /* Optimization: if the buffer contains JUST our bulk element
+            /* Optimization: if a non-master client's buffer contains JUST our bulk element
              * instead of creating a new object by *copying* the sds we
              * just use the current sds string. */
-            if (c->qb_pos == 0 &&
+            if (!(c->flags & CLIENT_MASTER) &&
+                c->qb_pos == 0 &&
                 c->bulklen >= PROTO_MBULK_BIG_ARG &&
                 sdslen(c->querybuf) == (size_t)(c->bulklen+2))
             {
@@ -2388,8 +2417,8 @@ void commandProcessed(client *c) {
     if (c->flags & CLIENT_MASTER) {
         long long applied = c->reploff - prev_offset;
         if (applied) {
-            replicationFeedStreamFromMasterStream(c->pending_querybuf,applied);
-            sdsrange(c->pending_querybuf,applied,-1);
+            replicationFeedStreamFromMasterStream(c->querybuf+c->repl_applied,applied);
+            c->repl_applied += applied;
         }
     }
 }
@@ -2432,12 +2461,21 @@ int processCommandAndResetClient(client *c) {
 /* This function will execute any fully parsed commands pending on
  * the client. Returns C_ERR if the client is no longer valid after executing
  * the command, and C_OK for all other cases. */
-int processPendingCommandsAndResetClient(client *c) {
+int processPendingCommandAndInputBuffer(client *c) {
     if (c->flags & CLIENT_PENDING_COMMAND) {
         c->flags &= ~CLIENT_PENDING_COMMAND;
         if (processCommandAndResetClient(c) == C_ERR) {
             return C_ERR;
         }
+    }
+
+    /* Now process client if it has more data in it's buffer.
+     *
+     * Note: when a master client steps into this function,
+     * it can always satisfy this condition, because its querbuf
+     * contains data not applied. */
+    if (c->querybuf && sdslen(c->querybuf) > 0) {
+        return processInputBuffer(c);
     }
     return C_OK;
 }
@@ -2510,8 +2548,26 @@ int processInputBuffer(client *c) {
         }
     }
 
-    /* Trim to pos */
-    if (c->qb_pos) {
+    if (c->flags & CLIENT_MASTER) {
+        /* If the client is a master, trim the querybuf to repl_applied,
+         * since master client is very special, its querybuf not only
+         * used to parse command, but also proxy to sub-replicas.
+         *
+         * Here are some scenarios we cannot trim to qb_pos:
+         * 1. we don't receive complete command from master
+         * 2. master client blocked cause of client pause
+         * 3. io threads operate read, master client flagged with CLIENT_PENDING_COMMAND
+         *
+         * In these scenarios, qb_pos points to the part of the current command
+         * or the beginning of next command, and the current command is not applied yet,
+         * so the repl_applied is not equal to qb_pos. */
+        if (c->repl_applied) {
+            sdsrange(c->querybuf,c->repl_applied,-1);
+            c->qb_pos -= c->repl_applied;
+            c->repl_applied = 0;
+        }
+    } else if (c->qb_pos) {
+        /* Trim to pos */
         sdsrange(c->querybuf,c->qb_pos,-1);
         c->qb_pos = 0;
     }
@@ -2519,7 +2575,8 @@ int processInputBuffer(client *c) {
     /* Update client memory usage after processing the query buffer, this is
      * important in case the query buffer is big and wasn't drained during
      * the above loop (because of partially sent big commands). */
-    updateClientMemUsage(c);
+    if (io_threads_op == IO_THREADS_OP_IDLE)
+        updateClientMemUsage(c);
 
     return C_OK;
 }
@@ -2546,16 +2603,22 @@ void readQueryFromClient(connection *conn) {
     if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1
         && c->bulklen >= PROTO_MBULK_BIG_ARG)
     {
-        ssize_t remaining = (size_t)(c->bulklen+2)-sdslen(c->querybuf);
+        ssize_t remaining = (size_t)(c->bulklen+2)-(sdslen(c->querybuf)-c->qb_pos);
         big_arg = 1;
 
         /* Note that the 'remaining' variable may be zero in some edge case,
          * for example once we resume a blocked client after CLIENT PAUSE. */
         if (remaining > 0) readlen = remaining;
+
+        /* Master client needs expand the readlen when meet BIG_ARG(see #9100),
+         * but doesn't need align to the next arg, we can read more data. */
+        if (c->flags & CLIENT_MASTER && readlen < PROTO_IOBUF_LEN)
+            readlen = PROTO_IOBUF_LEN;
     }
 
     qblen = sdslen(c->querybuf);
-    if (big_arg || sdsalloc(c->querybuf) < PROTO_IOBUF_LEN) {
+    if (!(c->flags & CLIENT_MASTER) && // master client's querybuf can grow greedy.
+        (big_arg || sdsalloc(c->querybuf) < PROTO_IOBUF_LEN)) {
         /* When reading a BIG_ARG we won't be reading more than that one arg
          * into the query buffer, so we don't need to pre-allocate more than we
          * need, so using the non-greedy growing. For an initial allocation of
@@ -2585,12 +2648,6 @@ void readQueryFromClient(connection *conn) {
         }
         freeClientAsync(c);
         goto done;
-    } else if (c->flags & CLIENT_MASTER) {
-        /* Append the query buffer to the pending (not applied) buffer
-         * of the master. We'll use this buffer later in order to have a
-         * copy of the string applied by the last command executed. */
-        c->pending_querybuf = sdscatlen(c->pending_querybuf,
-                                        c->querybuf+qblen,nread);
     }
 
     sdsIncrLen(c->querybuf,nread);
@@ -2613,7 +2670,7 @@ void readQueryFromClient(connection *conn) {
 
     /* There is more data in the client input buffer, continue parsing it
      * and check if there is a full command to execute. */
-     if (processInputBuffer(c) == C_ERR)
+    if (processInputBuffer(c) == C_ERR)
          c = NULL;
 
 done:
@@ -2868,8 +2925,6 @@ void clientCommand(client *c) {
 "    Control the replies sent to the current connection.",
 "SETNAME <name>",
 "    Assign the name <name> to the current connection.",
-"GETNAME",
-"    Get the name of the current connection.",
 "UNBLOCK <clientid> [TIMEOUT|ERROR]",
 "    Unblock the specified blocked client.",
 "TRACKING (ON|OFF) [REDIRECT <id>] [BCAST] [PREFIX <prefix> [...]]",
@@ -3075,6 +3130,10 @@ NULL
         if (getLongLongFromObjectOrReply(c,c->argv[2],&id,NULL)
             != C_OK) return;
         struct client *target = lookupClientByID(id);
+        /* Note that we never try to unblock a client blocked on a module command, which
+         * doesn't have a timeout callback (even in the case of UNBLOCK ERROR).
+         * The reason is that we assume that if a command doesn't expect to be timedout,
+         * it also doesn't expect to be unblocked by CLIENT UNBLOCK */
         if (target && target->flags & CLIENT_BLOCKED && moduleBlockedClientMayTimeout(target)) {
             if (unblock_error)
                 addReplyError(target,
@@ -3464,7 +3523,11 @@ static void retainOriginalCommandVector(client *c) {
  * original_argv array. */
 void redactClientCommandArgument(client *c, int argc) {
     retainOriginalCommandVector(c);
-    decrRefCount(c->argv[argc]);
+    if (c->original_argv[argc] == shared.redacted) {
+        /* This argument has already been redacted */
+        return;
+    }
+    decrRefCount(c->original_argv[argc]);
     c->original_argv[argc] = shared.redacted;
 }
 
@@ -3766,7 +3829,7 @@ void flushSlavesOutputBuffers(void) {
     }
 }
 
-/* Compute current most restictive pause type and its end time, aggregated for
+/* Compute current most restrictive pause type and its end time, aggregated for
  * all pause purposes. */
 static void updateClientPauseTypeAndEndTime(void) {
     pause_type old_type = server.client_pause_type;
@@ -4165,15 +4228,13 @@ int handleClientsWithPendingWritesUsingThreads(void) {
     while((ln = listNext(&li))) {
         client *c = listNodeValue(ln);
 
-        /* Update the client in the mem usage buckets after we're done processing it in the io-threads */
-        updateClientMemUsageBucket(c);
+        /* Update the client in the mem usage after we're done processing it in the io-threads */
+        updateClientMemUsage(c);
 
         /* Install the write handler if there are pending writes in some
          * of the clients. */
-        if (clientHasPendingReplies(c) &&
-                connSetWriteHandler(c->conn, sendReplyToClient) == AE_ERR)
-        {
-            freeClientAsync(c);
+        if (clientHasPendingReplies(c)) {
+            installClientWriteHandler(c);
         }
     }
     listEmpty(server.clients_pending_write);
@@ -4274,17 +4335,10 @@ int handleClientsWithPendingReadsUsingThreads(void) {
             continue;
         }
 
-        /* Once io-threads are idle we can update the client in the mem usage buckets */
-        updateClientMemUsageBucket(c);
+        /* Once io-threads are idle we can update the client in the mem usage */
+        updateClientMemUsage(c);
 
-        if (processPendingCommandsAndResetClient(c) == C_ERR) {
-            /* If the client is no longer valid, we avoid
-             * processing the client later. So we just go
-             * to the next. */
-            continue;
-        }
-
-        if (processInputBuffer(c) == C_ERR) {
+        if (processPendingCommandAndInputBuffer(c) == C_ERR) {
             /* If the client is no longer valid, we avoid
              * processing the client later. So we just go
              * to the next. */
@@ -4292,10 +4346,10 @@ int handleClientsWithPendingReadsUsingThreads(void) {
         }
 
         /* We may have pending replies if a thread readQueryFromClient() produced
-         * replies and did not install a write handler (it can't).
+         * replies and did not put the client in pending write queue (it can't).
          */
         if (!(c->flags & CLIENT_PENDING_WRITE) && clientHasPendingReplies(c))
-            clientInstallWriteHandler(c);
+            putClientInPendingWriteQueue(c);
     }
 
     /* Update processed count on server */

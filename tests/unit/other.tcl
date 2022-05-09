@@ -311,7 +311,7 @@ start_server {tags {"other"}} {
         assert_error {*unknown command*} {r GET|SET}
         assert_error {*unknown command*} {r GET|SET|OTHER}
         assert_error {*unknown command*} {r CONFIG|GET GET_XX}
-        assert_error {*Unknown subcommand*} {r CONFIG GET_XX}
+        assert_error {*unknown subcommand*} {r CONFIG GET_XX}
     }
 }
 
@@ -332,7 +332,8 @@ start_server {tags {"other external:skip"}} {
         # Hash table should not rehash
         assert_no_match "*table size: 8192*" [r debug HTSTATS 9]
         exec kill -9 [get_child_pid 0]
-        after 200
+        waitForBgsave r
+        after 200 ;# waiting for serverCron
 
         # Hash table should rehash since there is no child process,
         # size is power of two and over 4098, so it is 8192
